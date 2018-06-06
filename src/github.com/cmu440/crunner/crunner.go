@@ -19,7 +19,6 @@ const (
 // read and print out the server's response to standard output. Whether or
 // not you add any code to this file will not affect your grade.
 func main() {
-	fmt.Println("Not implemented.")
 	conn, err := net.Dial("tcp", "localhost:9999")
 	if err != nil {
 		fmt.Println("Failed to start: ", err.Error())
@@ -36,9 +35,9 @@ func main() {
 			return
 		}
 
-        _, err := conn.Write([]byte(command))
-        if err != nil {
-            return
-        }
+		_, err := conn.Write([]byte(command))
+		if err != nil {
+			return
+		}
 	}
 }

@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"p0-1/src/github.com/cmu440/p0"
+	"../p0"
 )
 
 const defaultPort = 9999

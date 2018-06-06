@@ -1,168 +1,235 @@
 // Implementation of a KeyValueServer. Students should write their code in this file.
+// Implementation of a KeyValueServer.
 
 package p0
 
 import (
-	"fmt"
+	"bufio"
+	"bytes"
+	// "fmt"
 	"io"
 	"net"
 	"strconv"
-	"strings"
 )
 
-const bufSize = 1024
+const MAX_MESSAGE_QUEUE_LENGTH = 500
 
-var buff = make([]byte, bufSize)
-
-type channelMap struct {
-	writeMap map[string]chan []byte
+// Stores a connection and corresponding message queue.
+type client struct {
+	connection       net.Conn
+	messageQueue     chan []byte
+	quitSignal_Read  chan int
+	quitSignal_Write chan int
 }
 
-func (c *channelMap) Put(key string) chan []byte {
-	result := make(chan []byte, 500)
-	c.writeMap[key] = result
-	return result
+// Used to specify DBRequests
+type db struct {
+	isGet bool
+	key   string
+	value []byte
 }
 
-func (c *channelMap) Get(key string) chan []byte {
-	return c.writeMap[key]
-}
-
+// Implements KeyValueServer.
 type keyValueServer struct {
-	listen          net.Listener
-	clientCount     int
-	clients         map[string]net.Conn
-	clientMsgs      map[string]chan []byte
-	addClientChan   chan net.Conn
-	closeClientChan chan string
-	serverWriteMap  channelMap
-	serverWriteChan chan string
+	listener          net.Listener
+	currentClients    []*client
+	newMessage        chan []byte
+	newConnection     chan net.Conn
+	deadClient        chan *client
+	dbQuery           chan *db
+	dbResponse        chan *db
+	countClients      chan int
+	clientCount       chan int
+	quitSignal_Main   chan int
+	quitSignal_Accept chan int
 }
 
-// New creates and returns (but does not start) a new KeyValueServer.
+// Initializes a new KeyValueServer.
 func New() KeyValueServer {
 	return &keyValueServer{
-		listen:          nil,
-		clientCount:     0,
-		clients:         make(map[string]net.Conn),
-		clientMsgs:      make(map[string]chan []byte),
-		addClientChan:   make(chan net.Conn),
-		closeClientChan: make(chan string),
-		serverWriteMap:  channelMap{writeMap: make(map[string]chan []byte)},
-		serverWriteChan: make(chan string),
-	}
+		nil,
+		nil,
+		make(chan []byte),
+		make(chan net.Conn),
+		make(chan *client),
+		make(chan *db),
+		make(chan *db),
+		make(chan int),
+		make(chan int),
+		make(chan int),
+		make(chan int)}
 }
 
-func (kvs *keyValueServer) Close() {
-	for _, conn := range kvs.clients {
-		conn.Close()
-		kvs.clientCount--
-	}
-	kvs.listen.Close()
-}
-
+// Implementation of Start for keyValueServer.
 func (kvs *keyValueServer) Start(port int) error {
-	listen, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
 	if err != nil {
-		fmt.Println("Failed to listen on port: ", port)
+		return err
 	}
-	kvs.listen = listen
-	go kvs.handleEvent()
-	go kvs.handleAccept()
-	return err
+
+	kvs.listener = ln
+	init_db()
+
+	go runServer(kvs)
+	go acceptRoutine(kvs)
+
+	return nil
 }
 
-func (kvs *keyValueServer) handleAccept() {
-	for {
-		conn, err := kvs.listen.Accept()
-		fmt.Printf("客户端：%s 已经连接!\n", conn.RemoteAddr().String())
-		if err != nil {
-			fmt.Printf("错误： %s\n", err.Error())
-		}
-		kvs.addClientChan <- conn
-	}
+// Implementation of Close for keyValueServer.
+func (kvs *keyValueServer) Close() {
+	kvs.listener.Close()
+	kvs.quitSignal_Main <- 0
+	kvs.quitSignal_Accept <- 0
 }
 
+// Implementation of Count.
 func (kvs *keyValueServer) Count() int {
-	return kvs.clientCount
+	kvs.countClients <- 0
+	return <-kvs.clientCount
 }
 
-func (kvs *keyValueServer) handleConn(conn net.Conn) {
-	if conn == nil {
-		return
-	}
+// Main server routine.
+func runServer(kvs *keyValueServer) {
+	// defer fmt.Println("\"runServer\" ended.")
 
-	for {
-		n, err := conn.Read(buff)
-		if err == io.EOF {
-			fmt.Printf("远程主机:%s 已经关闭!\n", conn.RemoteAddr().String())
-			kvs.closeClientChan <- conn.RemoteAddr().String()
-			return
-		}
-		if err != nil {
-			fmt.Printf("错误： %s", err.Error())
-			kvs.closeClientChan <- conn.RemoteAddr().String()
-			return
-		}
-		if string(buff[:n]) == "exit\r\n" {
-			fmt.Printf("客户端: %s 已经退出!\r\n", conn.RemoteAddr().String())
-			kvs.closeClientChan <- conn.RemoteAddr().String()
-			return
-		}
-		if n > 0 {
-			fmt.Printf("接收数据: %s", string(buff[:n]))
-		}
-		kvs.handleAction(string(buff[:n]), conn)
-	}
-}
-
-func (kvs *keyValueServer) handleAction(input string, conn net.Conn) {
-	fmt.Println(input)
-	command := strings.Fields(input)
-	addr := conn.RemoteAddr().String()
-	switch command[0] {
-	case "get":
-		kvs.serverWriteMap.Put(addr) <- []byte(get(command[1]))
-	case "put":
-		put(command[1], []byte(command[2]))
-		kvs.serverWriteMap.Put(addr) <- []byte("ok")
-	default:
-		kvs.serverWriteMap.Put(addr) <- []byte("输入的命令不合法！")
-	}
-	kvs.serverWriteChan <- conn.RemoteAddr().String()
-}
-
-func (kvs *keyValueServer) handleEvent() {
 	for {
 		select {
-		case conn := <-kvs.addClientChan:
-			kvs.addClient(conn)
-			go kvs.handleConn(conn)
-		case clientAddr := <-kvs.closeClientChan:
-			kvs.removeClient(clientAddr)
-		case clientAddr := <-kvs.serverWriteChan:
-			kvs.handleWrite(clientAddr)
+		// Send the message to each client's queue.
+		case newMessage := <-kvs.newMessage:
+			for _, c := range kvs.currentClients {
+				// If the queue is full, drop the oldest message.
+				if len(c.messageQueue) == MAX_MESSAGE_QUEUE_LENGTH {
+					<-c.messageQueue
+				}
+				c.messageQueue <- newMessage
+			}
+		// Add a new client to the client list.
+		case newConnection := <-kvs.newConnection:
+			c := &client{
+				newConnection,
+				make(chan []byte, MAX_MESSAGE_QUEUE_LENGTH),
+				make(chan int),
+				make(chan int)}
+			kvs.currentClients = append(kvs.currentClients, c)
+			go readRoutine(kvs, c)
+			go writeRoutine(c)
+
+		// Remove the dead client.
+		case deadClient := <-kvs.deadClient:
+			for i, c := range kvs.currentClients {
+				if c == deadClient {
+					kvs.currentClients =
+						append(kvs.currentClients[:i], kvs.currentClients[i+1:]...)
+					break
+				}
+			}
+
+		// Run a query on the DB
+		case request := <-kvs.dbQuery:
+			// response required for GET query
+			if request.isGet {
+				v := get(request.key)
+				kvs.dbResponse <- &db{
+					value: v,
+				}
+			} else {
+				put(request.key, request.value)
+			}
+
+		// Get the number of clients.
+		case <-kvs.countClients:
+			kvs.clientCount <- len(kvs.currentClients)
+
+		// End each client routine.
+		case <-kvs.quitSignal_Main:
+			for _, c := range kvs.currentClients {
+				c.connection.Close()
+				c.quitSignal_Write <- 0
+				c.quitSignal_Read <- 0
+			}
+			return
 		}
 	}
 }
 
-func (kvs *keyValueServer) handleWrite(addr string) {
-	content := <-kvs.serverWriteMap.Get(addr)
-	kvs.clients[addr].Write(content)
-}
+// One running instance; accepts new clients and sends them to the server.
+func acceptRoutine(kvs *keyValueServer) {
+	// defer fmt.Println("\"acceptRoutine\" ended.")
 
-func (kvs *keyValueServer) addClient(conn net.Conn) {
-	if _, ok := kvs.clientMsgs[conn.RemoteAddr().String()]; !ok {
-		kvs.clientMsgs[conn.RemoteAddr().String()] = make(chan []byte, 100)
+	for {
+		select {
+		case <-kvs.quitSignal_Accept:
+			return
+		default:
+			conn, err := kvs.listener.Accept()
+			if err == nil {
+				kvs.newConnection <- conn
+			}
+		}
 	}
-	kvs.clients[conn.RemoteAddr().String()] = conn
-	kvs.clientCount++
 }
 
-func (kvs *keyValueServer) removeClient(addr string) {
-	if conn, ok := kvs.clients[addr]; ok {
-		conn.Close()
-		delete(kvs.clients, addr)
-		kvs.clientCount--
+// One running instance for each client; reads in
+// new  messages and sends them to the server.
+func readRoutine(kvs *keyValueServer, c *client) {
+	// defer fmt.Println("\"readRoutine\" ended.")
+
+	clientReader := bufio.NewReader(c.connection)
+
+	// Read in messages.
+	for {
+		select {
+		case <-c.quitSignal_Read:
+			return
+		default:
+			message, err := clientReader.ReadBytes('\n')
+
+			if err == io.EOF {
+				kvs.deadClient <- c
+			} else if err != nil {
+				return
+			} else {
+				tokens := bytes.Split(message, []byte(","))
+				if string(tokens[0]) == "put" {
+					key := string(tokens[1][:])
+
+					// do a "put" query
+					kvs.dbQuery <- &db{
+						isGet: false,
+						key:   key,
+						value: tokens[2],
+					}
+				} else {
+					// remove trailing \n from get,key\n request
+					keyBin := tokens[1][:len(tokens[1])-1]
+					key := string(keyBin[:])
+
+					// do a "get" query
+					kvs.dbQuery <- &db{
+						isGet: true,
+						key:   key,
+					}
+
+					response := <-kvs.dbResponse
+					kvs.newMessage <- append(append(keyBin, ","...), response.value...)
+				}
+			}
+		}
+	}
+}
+
+// One running instance for each client; writes messages
+// from the message queue to the client.
+func writeRoutine(c *client) {
+	// defer fmt.Println("\"writeRoutine\" ended.")
+
+	for {
+		select {
+		case <-c.quitSignal_Write:
+			return
+		case message := <-c.messageQueue:
+			c.connection.Write(message)
+		}
 	}
 }
